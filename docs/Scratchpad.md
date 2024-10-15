@@ -67,4 +67,140 @@
 
   기본적으로는 `read_issue_q.io.enq` 포트와 `io.dma.read.req` 포트가 연결되지만, `all_zeros` 필드가 `true` 인 경우 `read_issue_q.io.enq.valid` 를 `false` 로 만들고 `zero_writer.io.req` 에 값을 채우는 것을 볼 수 있다.
 
+3. 2에서 `read_issue_q` 모듈로 들어온 값은, DMA reader로 가서 값을 읽는다.
+
+- `read_issue_q.io.deq` 포트와 `reader.module` 모듈 연결 (L348-362)
+
+  ```scala
+  reader.module.io.req.valid := read_issue_q.io.deq.valid
+  read_issue_q.io.deq.ready := reader.module.io.req.ready
+  reader.module.io.req.bits.vaddr := read_issue_q.io.deq.bits.vaddr
+  reader.module.io.req.bits.spaddr := Mux(read_issue_q.io.deq.bits.laddr.is_acc_addr,
+    read_issue_q.io.deq.bits.laddr.full_acc_addr(), read_issue_q.io.deq.bits.laddr.full_sp_addr())
+  reader.module.io.req.bits.len := read_issue_q.io.deq.bits.cols
+  reader.module.io.req.bits.repeats := read_issue_q.io.deq.bits.repeats
+  reader.module.io.req.bits.pixel_repeats := read_issue_q.io.deq.bits.pixel_repeats
+  reader.module.io.req.bits.scale := read_issue_q.io.deq.bits.scale
+  reader.module.io.req.bits.is_acc := read_issue_q.io.deq.bits.laddr.is_acc_addr
+  reader.module.io.req.bits.accumulate := read_issue_q.io.deq.bits.laddr.accumulate
+  reader.module.io.req.bits.has_acc_bitwidth := read_issue_q.io.deq.bits.has_acc_bitwidth
+  reader.module.io.req.bits.block_stride := read_issue_q.io.deq.bits.block_stride
+  reader.module.io.req.bits.status := read_issue_q.io.deq.bits.status
+  reader.module.io.req.bits.cmd_id := read_issue_q.io.deq.bits.cmd_id
+  ```
+
+  필드 중 `is_acc` 을 이용하여 나중에 spad bank에 쓸지, acc bank에 쓸지 구분한다.
+
+4. 3에서 DMA reader에서 읽은 값은 spad bank에 쓸지, acc bank에 쓸지에 따라 `mvin_scale_in` 와 `mvin_scale_acc_in` 로 갈리고, 각각 `VectorScalarMultiplier` 모듈로 들어간다.
+
+- 코드 (L364-385, L400-411)
+
+  ```scala
+  val (mvin_scale_in, mvin_scale_out) = VectorScalarMultiplier(
+    config.mvin_scale_args,
+    config.inputType, config.meshColumns * config.tileColumns, chiselTypeOf(reader.module.io.resp.bits),
+    is_acc = false
+  )
+  val (mvin_scale_acc_in, mvin_scale_acc_out) = if (mvin_scale_shared) (mvin_scale_in, mvin_scale_out) else (
+    VectorScalarMultiplier(
+      config.mvin_scale_acc_args,
+      config.accType, config.meshColumns * config.tileColumns, chiselTypeOf(reader.module.io.resp.bits),
+      is_acc = true
+    )
+  )
+
+  mvin_scale_in.valid := reader.module.io.resp.valid && (mvin_scale_shared.B || !reader.module.io.resp.bits.is_acc ||
+    (reader.module.io.resp.bits.is_acc && !reader.module.io.resp.bits.has_acc_bitwidth))
+
+  mvin_scale_in.bits.in := reader.module.io.resp.bits.data.asTypeOf(chiselTypeOf(mvin_scale_in.bits.in))
+  mvin_scale_in.bits.scale := reader.module.io.resp.bits.scale.asTypeOf(mvin_scale_t)
+  mvin_scale_in.bits.repeats := reader.module.io.resp.bits.repeats
+  mvin_scale_in.bits.pixel_repeats := reader.module.io.resp.bits.pixel_repeats
+  mvin_scale_in.bits.last := reader.module.io.resp.bits.last
+  mvin_scale_in.bits.tag := reader.module.io.resp.bits
+  ```
+
+  ```scala
+  if (!mvin_scale_shared) {
+    mvin_scale_acc_in.valid := reader.module.io.resp.valid &&
+      (reader.module.io.resp.bits.is_acc && reader.module.io.resp.bits.has_acc_bitwidth)
+    mvin_scale_acc_in.bits.in := reader.module.io.resp.bits.data.asTypeOf(chiselTypeOf(mvin_scale_acc_in.bits.in))
+    mvin_scale_acc_in.bits.scale := reader.module.io.resp.bits.scale.asTypeOf(mvin_scale_acc_t)
+    mvin_scale_acc_in.bits.repeats := reader.module.io.resp.bits.repeats
+    mvin_scale_acc_in.bits.pixel_repeats := 1.U
+    mvin_scale_acc_in.bits.last := reader.module.io.resp.bits.last
+    mvin_scale_acc_in.bits.tag := reader.module.io.resp.bits
+
+    mvin_scale_acc_out.ready := false.B
+  }
+  ```
+
+5. 4에서 spad bank에 써서 `mvin_scale_out` 으로 나온 값은 `PixelRepeater` 로 들어간다.
+
+- 코드 (L387-L398)
+
+  ```scala
+  val mvin_scale_pixel_repeater = Module(new PixelRepeater(inputType, local_addr_t, block_cols, aligned_to, mvin_scale_out.bits.tag.cloneType, passthrough = !has_first_layer_optimizations))
+  mvin_scale_pixel_repeater.io.req.valid := mvin_scale_out.valid
+  mvin_scale_pixel_repeater.io.req.bits.in := mvin_scale_out.bits.out
+  mvin_scale_pixel_repeater.io.req.bits.mask := mvin_scale_out.bits.tag.mask take mvin_scale_pixel_repeater.io.req.bits.mask.size
+  mvin_scale_pixel_repeater.io.req.bits.laddr := mvin_scale_out.bits.tag.addr.asTypeOf(local_addr_t) + mvin_scale_out.bits.row
+  mvin_scale_pixel_repeater.io.req.bits.len := mvin_scale_out.bits.tag.len
+  mvin_scale_pixel_repeater.io.req.bits.pixel_repeats := mvin_scale_out.bits.tag.pixel_repeats
+  mvin_scale_pixel_repeater.io.req.bits.last := mvin_scale_out.bits.last
+  mvin_scale_pixel_repeater.io.req.bits.tag := mvin_scale_out.bits.tag
+
+  mvin_scale_out.ready := mvin_scale_pixel_repeater.io.req.ready
+  mvin_scale_pixel_repeater.io.resp.ready := false.B
+  ```
+
+6. 2에서 `zero_writer` 모듈로 들어온 값은, `PixelRepeater` 로 들어간다.
+
+- 코드 (L330-343)
+
+  ```scala
+  val zero_writer_pixel_repeater = Module(new PixelRepeater(inputType, local_addr_t, block_cols, aligned_to, new ScratchpadMemReadRequest(local_addr_t, mvin_scale_t_bits), passthrough = !has_first_layer_optimizations))
+  zero_writer_pixel_repeater.io.req.valid := zero_writer.io.resp.valid
+  zero_writer_pixel_repeater.io.req.bits.in := 0.U.asTypeOf(Vec(block_cols, inputType))
+  zero_writer_pixel_repeater.io.req.bits.laddr := zero_writer.io.resp.bits.laddr
+  zero_writer_pixel_repeater.io.req.bits.len := zero_writer.io.resp.bits.tag.cols
+  zero_writer_pixel_repeater.io.req.bits.pixel_repeats := zero_writer.io.resp.bits.tag.pixel_repeats
+  zero_writer_pixel_repeater.io.req.bits.last := zero_writer.io.resp.bits.last
+  zero_writer_pixel_repeater.io.req.bits.tag := zero_writer.io.resp.bits.tag
+  zero_writer_pixel_repeater.io.req.bits.mask := {
+    val n = inputType.getWidth / 8
+    val mask = zero_writer.io.resp.bits.mask
+    val expanded = VecInit(mask.flatMap(e => Seq.fill(n)(e)))
+    expanded
+  }
+  ```
+
+7. (1) 5에서 나온 값, (2) 4에서 acc bank에서 써서 `mvin_scale_acc_out` 으로 나온 값, (3) 6에서 나온 값 중 하나가 선택되어서 `io.dma.read.resp` 포트로 나간다.
+
+- 코드 (L416-436)
+
+  ```scala
+  val mvin_scale_finished = mvin_scale_pixel_repeater.io.resp.fire && mvin_scale_pixel_repeater.io.resp.bits.last
+  val mvin_scale_acc_finished = mvin_scale_acc_out.fire && mvin_scale_acc_out.bits.last
+  val zero_writer_finished = zero_writer_pixel_repeater.io.resp.fire && zero_writer_pixel_repeater.io.resp.bits.last
+
+  val zero_writer_bytes_read = Mux(zero_writer_pixel_repeater.io.resp.bits.laddr.is_acc_addr,
+    zero_writer_pixel_repeater.io.resp.bits.tag.cols * (accType.getWidth / 8).U,
+    zero_writer_pixel_repeater.io.resp.bits.tag.cols * (inputType.getWidth / 8).U)
+
+  // For DMA read responses, mvin_scale gets first priority, then mvin_scale_acc, and then zero_writer
+  io.dma.read.resp.valid := mvin_scale_finished || mvin_scale_acc_finished || zero_writer_finished
+
+  // io.dma.read.resp.bits.cmd_id := MuxCase(zero_writer.io.resp.bits.tag.cmd_id, Seq(
+  io.dma.read.resp.bits.cmd_id := MuxCase(zero_writer_pixel_repeater.io.resp.bits.tag.cmd_id, Seq(
+    // mvin_scale_finished -> mvin_scale_out.bits.tag.cmd_id,
+    mvin_scale_finished -> mvin_scale_pixel_repeater.io.resp.bits.tag.cmd_id,
+    mvin_scale_acc_finished -> mvin_scale_acc_out.bits.tag.cmd_id))
+
+  io.dma.read.resp.bits.bytesRead := MuxCase(zero_writer_bytes_read, Seq(
+    // mvin_scale_finished -> mvin_scale_out.bits.tag.bytes_read,
+    mvin_scale_finished -> mvin_scale_pixel_repeater.io.resp.bits.tag.bytes_read,
+    mvin_scale_acc_finished -> mvin_scale_acc_out.bits.tag.bytes_read))
+  ```
+
 To be continued...
