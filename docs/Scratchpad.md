@@ -1,5 +1,7 @@
 ## How DMA Read Processed
 
+DMA Read는 `mvin` 명령어를 처리하기 위해 실행된다. `mvin rs1, rs2` 는 Scratchpad[rs2] <= DRAM[Translate[rs1]] 을 수행하는데, DMA를 통해 main memory에서 데이터를 읽어오고 그 값을 scratchpad에 쓴다. 자세한 내용은 [ISA](https://github.com/minseongg/gemmini?tab=readme-ov-file#mvin-move-data-from-main-memory-to-scratchpad) 부분을 참고하자.
+
 1. DMA Read Request는 `io.dma.read.req` 포트를 통해 들어온다.
 
 - `io.dma` 포트 정의 (L208-211)
@@ -11,7 +13,7 @@
   }
   ```
 
-  > DMA read와 write는 포트 연결된 것을 보면 TLB와 밀접한 연관이 있는 것 같다.
+  DMA read request는 load controller로부터 들어오는데, DMA를 통해서 main memory의 값을 읽고 그걸 scratchpad에 쓴다. `dmaread` 는 결국 main memory를 read하고, 그걸 spad에 write하는 것.
 
 - `ScratchpadReadMemIO` 타입 정의 (L64-67)
 
@@ -44,6 +46,10 @@
   }
   ```
 
+  - `laddr`: Local Address
+  - `cols`: ??
+  - `block_stride`: ??
+
 2. 1에서 `io.dma.read.req` 포트를 통해 들어온 값은, `all_zeros` 필드의 값이 0이 아닌 경우 `read_issue_q` 모듈로, 0인 경우 `zero_writer` 모듈로 들어간다.
 
 - `io.dma.read.req` 포트와 `read_issue_q`, `zero_writer` 모듈 연결 (L315-328)
@@ -66,6 +72,8 @@
   ```
 
   기본적으로는 `read_issue_q.io.enq` 포트와 `io.dma.read.req` 포트가 연결되지만, `all_zeros` 필드가 `true` 인 경우 `read_issue_q.io.enq.valid` 를 `false` 로 만들고 `zero_writer.io.req` 에 값을 채우는 것을 볼 수 있다.
+
+  > `mvin` 의 `rs1` 이 0인 경우 scratchpad에 무조건 0을 쓰도록 구현되어 있는데, 이게 main memory에 실제로 0이 써져 있어서 그런 건지, 아니면 `rs1` 이 0일때만 특수하게 처리하는 것인지는 모르겠다.
 
 3. 2에서 `read_issue_q` 모듈로 들어온 값은, DMA reader로 가서 값을 읽는다.
 
