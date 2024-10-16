@@ -1,7 +1,89 @@
-## How DMA Read Processed
+# Scratchpad
 
-DMA Read는 `mvin` 명령어를 처리하기 위해 실행된다. `mvin rs1, rs2` 는 Scratchpad[rs2] <= DRAM[Translate[rs1]] 을 수행하는데, DMA를 통해 main memory에서 데이터를 읽어오고 그 값을 scratchpad에 쓴다. 자세한 내용은 [ISA](https://github.com/minseongg/gemmini?tab=readme-ov-file#mvin-move-data-from-main-memory-to-scratchpad) 부분을 참고하자.
+## Meta
 
+이 모듈은 내부적으로 `sp_banks` 개의 `ScratchpadBank` 와 `acc_banks` 개의 `AccumulatorMem` 을 관리하면서, 들어오는 명령에 따라 값을 읽거나 쓴다. 우리가 타겟하는 config에서는 `sp_banks = 4`, `acc_banks = 2` 이다.
+
+이 모듈로 들어오는 명령은 크게 다음 네 가지로 분류할 수 있다.
+
+**1. ExRead (ExecuteController로부터 들어오는 Read 명령)**
+
+- IO 포트는 `io.srams.read`, `io.acc.read_req`, `io.acc.read_resp` 에 대응된다.
+- 실제로 계산을 하는 [`matmul.*` 명령어](https://github.com/minseongg/gemmini?tab=readme-ov-file#core-matmul-sequences)를 처리하기 위해 필요.
+- 접근 주소에 따라 `ScratchpadBank` 혹은 `AccumulatorMem` 에서 값을 읽음.
+
+**2. ExWrite (ExecuteController로부터 들어오는 Write 명령)**
+
+- IO 포트는 `io.srams.write`, `io.acc.write` 에 대응된다.
+- 실제로 계산을 하는 [`matmul.*` 명령어](https://github.com/minseongg/gemmini?tab=readme-ov-file#core-matmul-sequences)를 처리하기 위해 필요.
+- 접근 주소에 따라 `ScratchpadBank` 혹은 `AccumulatorMem` 에 값을 씀.
+
+**3. DmaRead (LoadController로부터 들어오는 Write 명령)**
+
+- IO 포트는 `io.dma.read` 에 대응된다.
+- Main Memory의 값을 Scratchpad로 가져오는 [`mvin` 명령어](https://github.com/minseongg/gemmini?tab=readme-ov-file#mvin-move-data-from-main-memory-to-scratchpad)를 처리하기 위해 필요. (Scratchpad[rs2] <= DRAM[Translate[rs1]])
+- 접근 주소에 따라 `ScratchpadBank` 혹은 `Accumulator` 에 값을 씀.
+- **DMA를 통해 Main Memory에서 값을 읽고 ("DmaRead"), 이 값을 Scratchpad에 쓴다 ("Write 명령"). 헷갈리지 않게 주의.**
+
+**4. DmaWrite (StoreController로부터 들어오는 Read 명령)**
+
+- IO 포트는 `io.dma.write` 에 대응된다.
+- Scratchpad의 값을 Main Memory로 보내주는 [`mvout` 명령어](https://github.com/minseongg/gemmini?tab=readme-ov-file#mvout-move-data-from-scratchpad-to-l2dram)를 처리하기 위해 필요. (DRAM[Translate[rs1]] <= Scratchpad[rs2])
+- 접근 주소에 따라 `ScratchpadBank` 혹은 `Accumulator` 에서 값을 읽음.
+- **Scratchpad에서 값을 읽고 ("Read 명령"), 이 값을 DMA를 통해 Main Memory에 쓴다 ("DmaWrite"). 헷갈리지 않게 주의.**
+
+위 명령들을 받기 위해 Scratchpad 모듈과 각 Controller 모듈들을 연결해주는 코드는 Controller.scala의 L249-256에 있다.
+
+```scala
+spad.module.io.dma.read <> load_controller.io.dma
+spad.module.io.dma.write <> store_controller.io.dma
+ex_controller.io.srams.read <> spad.module.io.srams.read
+ex_controller.io.srams.write <> spad.module.io.srams.write
+spad.module.io.acc.read_req <> ex_controller.io.acc.read_req
+ex_controller.io.acc.read_resp <> spad.module.io.acc.read_resp
+ex_controller.io.acc.write <> spad.module.io.acc.write
+```
+
+## ExRead 명령 처리 흐름
+
+### `ScratchpadBank` 에서 읽는 경우
+
+1. `io.srams.read(i).req` 포트를 통해 Request를 받는다. 여기서 `i` 는 Bank index를 나타낸다.
+2. Request에서 받은 주소로 `ScratchpadBank` 에 read request를 보낸다.
+3. `ScratchpadBank` 에서 받은 read data를 pipeline에 넣는다.
+4. Pipeline에서 나온 값을 `io.srams.read(i).resp` 포트를 통해 Response로 보내준다.
+
+### `AccumulatorMem` 에서 읽는 경우
+
+1. `io.acc.read_req(i)` 포트를 통해 Request를 받는다. 여기서 `i` 는 Bank index를 나타낸다.
+2. Request에서 받은 주소로 `AccumulatorMem` 에 read request를 보낸다.
+3. ?? (dma write 명령에서 나온 write norm queue 값과 동기화되어서 normalization, scaling을 함. 왜 이게 필요한지는 아직 모르겠음)
+
+## ExWrite 명령 처리 흐름
+
+### `ScratchpadBank` 에 쓰는 경우
+
+1. `io.srams.write(i).req` 포트를 통해 Request를 받는다. 여기서 `i` 는 Bank index를 나타낸다.
+2. Request에서 받은 주소로 `ScratchpadBank` 에 write request를 보낸다.
+
+### `AccumulatorMem` 에 쓰는 경우
+
+1. `io.acc.write(i).req` 포트를 통해 Request를 받는다. 여기서 `i` 는 Bank index를 나타낸다.
+2. Request에서 받은 주소로 `AccumulatorMem` 에 write request를 보낸다.
+
+## DmaRead 명령 처리 흐름
+
+DmaRead 명령 처리(Scratchpad[rs2] <= DRAM[Translate[rs1]])는 크게 다음 세 부분으로 나뉘어진다:
+
+- Main Memory에서 값 읽기 (Read from Main Memory)
+  + StreamRead 모듈에 Read Request를 보내서 Main Memory에서 값을 읽는다.
+  + 이때 virtual DRAM address (`rs1`) 이 0인 경우, Main Memory에서 값을 읽지 않고 Scratchpad에 0을 쓰도록 한다. (이게 단순히 최적화인지, 아니면 `rs1 = 0` 에 대한 예외 처리 같은 것인지는 아직 모르겠음)
+  + 해당되는 Bank에 Write Request를 보내서 Main Memory에서 읽은 값을 쓰게 한다.
+  + Bank에 Write Request를 보냄과 동시에, DmaRead 명령에 대한 Response를 보내줌. 이는 실제로 Bank에 값을 쓰기 전에 완료됨.
+- ScratchpadBank / AccumulatorMem에 값 쓰기 (Write to ScratchpadBank / AccumulatorMem)
+  + Bank에서 Wrie Request를 처리한다.
+
+<!--
 1. DMA Read Request는 `io.dma.read.req` 포트를 통해 들어온다.
 
 - `io.dma` 포트 정의 (L208-211)
@@ -212,11 +294,25 @@ DMA Read는 `mvin` 명령어를 처리하기 위해 실행된다. `mvin rs1, rs2
     mvin_scale_finished -> mvin_scale_pixel_repeater.io.resp.bits.tag.bytes_read,
     mvin_scale_acc_finished -> mvin_scale_acc_out.bits.tag.bytes_read))
   ```
+-->
 
-## How DMA Write Processed
+## DmaWrite 명령 처리 흐름
 
-[ISA](https://github.com/minseongg/gemmini?tab=readme-ov-file#mvout-move-data-from-scratchpad-to-l2dram) 를 참고하자.
+DmaWrite 명령 처리(DRAM[Translate[rs1]] <= Scratchpad[rs2])는 크게 다음 세 부분으로 나뉘어진다:
 
+- 전처리 (Preprocess)
+  + Scratchpad local address (`rs2`) 를 보고 ScratchpadBank와 AccumulatorMem 중 어디에서 읽어야 할지, Bank index는 무엇인지 계산.
+  + 해당하는 Bank에 Read Request를 보냄.
+  + Bank에 Read Request를 보냄과 동시에, DmaWrite 명령에 대한 Response를 보내줌. 이는 실제로 Bank에서 값을 읽기 전에 완료됨.
+- ScratchpadBank / AccumulatorMem에서 값 읽기 (Read from ScratchpadBank / AccumulatorMem):
+  + 각 Bank에서는 전처리 과정에서 들어온 Read Request를 받아서 Response를 내놓음.
+  + AccumulatorMem에서 값을 읽은 경우 추가적인 Normalization, Scaling 작업을 진행함.
+- Main Memory에 값 쓰기 (Write to Main Memory)
+  + StreamWriter 모듈에 Write Request를 보내서 Main Memory에 값을 쓴다.
+
+More details: to be continued...
+
+<!--
 ### 전처리
 
 - 코드 (L270-273)
@@ -290,5 +386,4 @@ write norm queue -> normalizer -> write scale queue -> accumulator scale -> writ
 ```scala
 
 ```
-
-To be continued...
+-->
