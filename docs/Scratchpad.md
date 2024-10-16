@@ -46,9 +46,11 @@ DMA Read는 `mvin` 명령어를 처리하기 위해 실행된다. `mvin rs1, rs2
   }
   ```
 
-  - `laddr`: Local Address
-  - `cols`: ??
-  - `block_stride`: ??
+  - `vaddr`: Virtual DRAM address (byte addressed) to load into scratchpad
+  - `laddr`: Local scratchpad or accumulator address. It contains some information indicates the address is in spad/acc, and the bank index.
+  - `cols`: Number of columns to store
+  - `block_stride`: Main memory stride set by [`config_mvin` command](https://github.com/minseongg/gemmini?tab=readme-ov-file#config_mvin-configures-the-load-pipeline)
+  - ...
 
 2. 1에서 `io.dma.read.req` 포트를 통해 들어온 값은, `all_zeros` 필드의 값이 0이 아닌 경우 `read_issue_q` 모듈로, 0인 경우 `zero_writer` 모듈로 들어간다.
 
@@ -210,5 +212,83 @@ DMA Read는 `mvin` 명령어를 처리하기 위해 실행된다. `mvin rs1, rs2
     mvin_scale_finished -> mvin_scale_pixel_repeater.io.resp.bits.tag.bytes_read,
     mvin_scale_acc_finished -> mvin_scale_acc_out.bits.tag.bytes_read))
   ```
+
+## How DMA Write Processed
+
+[ISA](https://github.com/minseongg/gemmini?tab=readme-ov-file#mvout-move-data-from-scratchpad-to-l2dram) 를 참고하자.
+
+### 전처리
+
+- 코드 (L270-273)
+
+  ```scala
+  // Garbage can immediately fire from dispatch_q -> norm_q
+  when (write_dispatch_q.bits.laddr.is_garbage()) {
+    write_norm_q.io.enq <> write_dispatch_q
+  }
+  ```
+
+  - local address가 garbage이면 바로 write norm queue로 보내지고, garbage가 아니면 scratchpad/accumulator에서 값을 읽는다.
+
+### Scratchpad/Accumulator에서 값을 읽는 과정
+
+- Scratchpad쪽 코드 (L462-466)
+
+  ```scala
+  // TODO we tie the write dispatch queue's, and write issue queue's, ready and valid signals together here
+  val dmawrite = write_dispatch_q.valid && write_norm_q.io.enq.ready &&
+    !write_dispatch_q.bits.laddr.is_garbage() &&
+    !(bio.write.en && config.sp_singleported.B) &&
+    !write_dispatch_q.bits.laddr.is_acc_addr && write_dispatch_q.bits.laddr.sp_bank() === i.U
+  ```
+
+  - `write_dispatch_q.valid && write_norm_q.io.enq.ready`: write dispatch queue에서 나와서 write norm queue로 들어갈 수 있어야 scratchpad에서 읽음.
+  - `!write_dispatch_q.bits.laddr.is_garbage()`: local address가 garbage이면 scratchpad에서 값을 읽을 필요가 없다.
+  - `!(bio.write.en && config.sp_singleported.B)`: scratchpad에 값을 쓰는 것과 동시에 읽으려고 하면 쓰는 게 우선적으로 진행된다.
+  - `!write_dispatch_q.bits.laddr.is_acc_addr && write_dispatch_q.bits.laddr.sp_bank() === i.U`: local address가 지금 scratchpad를 읽는 게 맞는지 확인.
+
+- Accumulator쪽 코드 (L656-659)
+
+  ```scala
+  // TODO we tie the write dispatch queue's, and write issue queue's, ready and valid signals together here
+  val dmawrite = write_dispatch_q.valid && write_norm_q.io.enq.ready &&
+    !write_dispatch_q.bits.laddr.is_garbage() &&
+    write_dispatch_q.bits.laddr.is_acc_addr && write_dispatch_q.bits.laddr.acc_bank() === i.U
+  ```
+
+  - `write_dispatch_q.valid && write_norm_q.io.enq.ready`: write dispatch queue에서 나와서 write norm queue로 들어갈 수 있어야 accumulator에서 읽음.
+  - `!write_dispatch_q.bits.laddr.is_garbage()`: local address가 garbage이면 accumulator에서 값을 읽을 필요가 없다.
+  - `write_dispatch_q.bits.laddr.is_acc_addr && write_dispatch_q.bits.laddr.acc_bank() === i.U`: local address가 지금 accumulator를 읽는 게 맞는지 확인.
+
+- dma response 보내는 코드 (L479-484, L686-691)
+
+  ```scala
+  when (bio.read.req.fire) {
+    write_dispatch_q.ready := true.B
+    write_norm_q.io.enq.valid := true.B
+
+    io.dma.write.resp.valid := true.B
+  }
+  ```
+
+  ```scala
+  when (bio.read.req.fire) {
+    write_dispatch_q.ready := true.B
+    write_norm_q.io.enq.valid := true.B
+
+    io.dma.write.resp.valid := true.B
+  }
+  ```
+
+  - scratchpad나 accumulator에 값을 읽게 되면 write dispatch queue에서 나온 command id와 함께 바로 dma response를 보내준다.
+  - 또한 write norm queue에도 값을 쓴다.
+
+### Main memory에 값을 쓰는 과정
+
+write norm queue -> normalizer -> write scale queue -> accumulator scale -> write issue queue -> writer
+
+```scala
+
+```
 
 To be continued...
